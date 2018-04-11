@@ -1,13 +1,11 @@
 #!/bin/bash
 
-TELEGRAF_VERSION=1.5.3-azmon
-CONTAINER_URI=https://masdiagstore.blob.core.windows.net/share/
+DATE="$(date +%s)"
+COMMIT="$(git rev-parse --short HEAD)"
+BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 
-make
+GOOS=linux GOARCH=amd64 go build -i -ldflags "-X main.commit=${COMMIT} -X main.version=${DATE} -X main.branch=${BRANCH}" ./cmd/telegraf
 
-tar -cvfz telegraf-${TELEGRAF_VERSION}-l_amd64.tar.gz ./telegraf
+scp -i ~/.ssh/azure_telegraf_testing ./telegraf gunnar@52.171.33.166:
 
-azcopy \
-    --source ./telegraf-${TELEGRAF_VERSION}-l_amd64.tar.gz \
-    --destination $CONTAINER_URL/telegraf-${TELEGRAF_VERSION}-l_amd64.tar.gz \
-    --dest-key $AZURE_STORAGE_KEY
+rm telegraf
