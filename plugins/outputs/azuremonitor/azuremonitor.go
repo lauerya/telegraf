@@ -40,7 +40,7 @@ type AzureMonitor struct {
 
 	client *http.Client
 
-	cache       map[uint64]azureMonitorMetric
+	cache       map[string]*azureMonitorMetric
 	period      time.Duration
 	delay       time.Duration
 	periodStart time.Time
@@ -161,39 +161,6 @@ func (a *AzureMonitor) Connect() error {
 	return nil
 }
 
-// Description provides a description of the plugin
-func (a *AzureMonitor) Description() string {
-	return "Configuration for sending aggregate metrics to Azure Monitor"
-}
-
-// SampleConfig provides a sample configuration for the plugin
-func (a *AzureMonitor) SampleConfig() string {
-	return sampleConfig
-}
-
-// Close shuts down an any active connections
-func (a *AzureMonitor) Close() error {
-	// Close connection to the URL here
-	close(a.shutdown)
-	return nil
-}
-
-// Write writes metrics to the remote endpoint
-func (a *AzureMonitor) Write(metrics []telegraf.Metric) error {
-	log.Printf("metrics collected: %+v", metrics)
-
-	// Assemble stats on incoming metrics
-	for _, metric := range metrics {
-		select {
-		case a.metrics <- metric:
-		default:
-			log.Printf("metrics buffer is full")
-		}
-	}
-
-	return nil
-}
-
 func (a *AzureMonitor) validateCredentials() error {
 	// Use managed service identity
 	if a.useMsi {
@@ -233,216 +200,37 @@ func (a *AzureMonitor) validateCredentials() error {
 	return nil
 }
 
-func (a *AzureMonitor) add(metric telegraf.Metric) {
-	id := metric.HashID()
-	if azm, ok := a.cache[id]; !ok {
-		// hit an uncached metric, create caches for first time:
-		var dimensionNames []string
-		var dimensionValues []string
-		for i, tag := range metric.TagList() {
-			// Azure custom metrics service supports up to 10 dimensions
-			if i > 9 {
-				continue
-			}
-			dimensionNames = append(dimensionNames, tag.Key)
-			dimensionValues = append(dimensionValues, tag.Value)
-		}
-		// Field keys are stored as the last dimension
-		dimensionNames = append(dimensionNames, "field")
-
-		var seriesList []*azureMonitorSeries
-		// Store each field as a separate series with field key as a new dimension
-		for _, field := range metric.FieldList() {
-			azmseries := newAzureMonitorSeries(field, dimensionValues)
-			seriesList = append(seriesList, azmseries)
-		}
-
-		if len(seriesList) < 1 {
-			log.Printf("no valid fields for metric: %s", metric)
-			return
-		}
-
-		a.cache[id] = azureMonitorMetric{
-			Time: metric.Time(),
-			Data: &azureMonitorData{
-				BaseData: &azureMonitorBaseData{
-					Metric:         metric.Name(),
-					Namespace:      "default",
-					DimensionNames: dimensionNames,
-					Series:         seriesList,
-				},
-			},
-		}
-	} else {
-		for _, f := range metric.FieldList() {
-			fv, ok := convert(f.Value)
-			if !ok {
-				continue
-			}
-
-			tmp, ok := azm.findSeriesWithField(f.Key)
-			if !ok {
-				// hit an uncached field of a cached metric
-				var dimensionValues []string
-				for i, tag := range metric.TagList() {
-					// Azure custom metrics service supports up to 10 dimensions
-					if i > 9 {
-						continue
-					}
-					dimensionValues = append(dimensionValues, tag.Value)
-				}
-				azm.Data.BaseData.Series = append(azm.Data.BaseData.Series, newAzureMonitorSeries(f, dimensionValues))
-				continue
-			}
-
-			//counter compute
-			n := tmp.Count + 1
-			tmp.Count = n
-			//max/min compute
-			if fv < tmp.Min {
-				tmp.Min = fv
-			} else if fv > tmp.Max {
-				tmp.Max = fv
-			}
-			//sum compute
-			tmp.Sum += fv
-			//store final data
-			a.cache[id].Data.BaseData.Series = append(a.cache[id].Data.BaseData.Series, tmp)
-		}
-	}
+// Description provides a description of the plugin
+func (a *AzureMonitor) Description() string {
+	return "Configuration for sending aggregate metrics to Azure Monitor"
 }
 
-func (b *azureMonitorMetric) findSeriesWithField(f string) (*azureMonitorSeries, bool) {
-	if len(b.Data.BaseData.Series) > 0 {
-		for _, s := range b.Data.BaseData.Series {
-			if f == s.DimensionValues[len(s.DimensionValues)-1] {
-				return s, true
-			}
+// SampleConfig provides a sample configuration for the plugin
+func (a *AzureMonitor) SampleConfig() string {
+	return sampleConfig
+}
+
+// Close shuts down an any active connections
+func (a *AzureMonitor) Close() error {
+	// Close connection to the URL here
+	close(a.shutdown)
+	return nil
+}
+
+// Write writes metrics to the remote endpoint
+func (a *AzureMonitor) Write(metrics []telegraf.Metric) error {
+	log.Printf("metrics collected: %s", metrics)
+
+	// Assemble stats on incoming metrics
+	for _, metric := range metrics {
+		select {
+		case a.metrics <- metric:
+		default:
+			log.Printf("metrics buffer is full")
 		}
 	}
-	return nil, false
-}
 
-func newAzureMonitorSeries(f *telegraf.Field, dv []string) *azureMonitorSeries {
-	fv, ok := convert(f.Value)
-	if !ok {
-		log.Printf("unable to convert field %s (type %T) to float type: %v", f.Key, fv, fv)
-		return nil
-	}
-	return &azureMonitorSeries{
-		DimensionValues: append(append([]string{}, dv...), f.Key),
-		Min:             fv,
-		Max:             fv,
-		Sum:             fv,
-		Count:           1,
-	}
-}
-
-func (a *AzureMonitor) reset() {
-	a.cache = make(map[uint64]azureMonitorMetric)
-}
-
-func convert(in interface{}) (float64, bool) {
-	switch v := in.(type) {
-	case int:
-		return float64(v), true
-	case int8:
-		return float64(v), true
-	case int16:
-		return float64(v), true
-	case int32:
-		return float64(v), true
-	case int64:
-		return float64(v), true
-	case uint:
-		return float64(v), true
-	case uint8:
-		return float64(v), true
-	case uint16:
-		return float64(v), true
-	case uint32:
-		return float64(v), true
-	case uint64:
-		return float64(v), true
-	case float32:
-		return float64(v), true
-	case float64:
-		return v, true
-	case string:
-		f, err := strconv.ParseFloat(v, 64)
-		if err != nil {
-			log.Printf("converted string: %s to %v", v, f)
-			return 0, false
-		}
-		return f, true
-	default:
-		log.Printf("did not convert %T: %s", v, v)
-		return 0, false
-	}
-}
-
-func (a *AzureMonitor) push() {
-	var body []byte
-	for _, metric := range a.cache {
-		jsonBytes, err := json.Marshal(&metric)
-		log.Printf("marshalled point %s", jsonBytes)
-		if err != nil {
-			log.Printf("Error marshalling metrics %s", err)
-			return
-		}
-		body = append(body, jsonBytes...)
-		body = append(body, '\n')
-	}
-
-	log.Printf("Publishing metrics %s", body)
-	_, err := a.postData(&body)
-	if err != nil {
-		log.Printf("Error publishing metrics %s", err)
-		return
-	}
-
-	return
-}
-
-func (a *AzureMonitor) postData(msg *[]byte) (*http.Request, error) {
-	metricsEndpoint := fmt.Sprintf("https://%s.monitoring.azure.com%s/metrics",
-		a.Region, a.ResourceID)
-
-	req, err := http.NewRequest("POST", metricsEndpoint, bytes.NewBuffer(*msg))
-	if err != nil {
-		log.Printf("Error creating HTTP request")
-		return nil, err
-	}
-
-	req.Header.Set("Authorization", "Bearer "+a.bearerToken)
-	req.Header.Set("Content-Type", "application/x-ndjson")
-
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-	}
-	client := http.Client{
-		Transport: tr,
-		// TODO - fix this
-		//Timeout: time.Duration(s.HTTPPostTimeout * time.Second),
-		Timeout: time.Duration(10 * time.Second),
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return req, err
-	}
-
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 || resp.StatusCode < 200 {
-		var reply []byte
-		reply, err = ioutil.ReadAll(resp.Body)
-
-		if err != nil {
-			reply = nil
-		}
-		return req, fmt.Errorf("Post Error. HTTP response code:%d message:%s reply:\n%s",
-			resp.StatusCode, resp.Status, reply)
-	}
-	return req, nil
+	return nil
 }
 
 func (a *AzureMonitor) run() {
@@ -493,6 +281,205 @@ func (a *AzureMonitor) run() {
 			a.reset()
 		}
 	}
+}
+
+func (a *AzureMonitor) reset() {
+	a.cache = make(map[string]*azureMonitorMetric)
+}
+
+func (a *AzureMonitor) add(metric telegraf.Metric) {
+	var dimensionNames []string
+	var dimensionValues []string
+	for i, tag := range metric.TagList() {
+		// Azure custom metrics service supports up to 10 dimensions
+		if i > 10 {
+			continue
+		}
+		dimensionNames = append(dimensionNames, tag.Key)
+		dimensionValues = append(dimensionValues, tag.Value)
+	}
+
+	for _, f := range metric.FieldList() {
+		name := metric.Name() + "_" + f.Key
+		fv, ok := convert(f.Value)
+		if !ok {
+			log.Printf("unable to convert field %s (type %T) to float type: %v", f.Key, fv, fv)
+			continue
+		}
+
+		if azm, ok := a.cache[name]; !ok {
+			// hit an uncached metric, create it for first time
+			a.cache[name] = &azureMonitorMetric{
+				Time: metric.Time(),
+				Data: &azureMonitorData{
+					BaseData: &azureMonitorBaseData{
+						Metric:         name,
+						Namespace:      "default",
+						DimensionNames: dimensionNames,
+						Series: []*azureMonitorSeries{
+							newAzureMonitorSeries(dimensionValues, fv),
+						},
+					},
+				},
+			}
+		} else {
+			tmp, i, ok := azm.findSeries(dimensionValues)
+			if !ok {
+				// add series new series (should be rare)
+				n := append(azm.Data.BaseData.Series, newAzureMonitorSeries(dimensionValues, fv))
+				a.cache[name].Data.BaseData.Series = n
+				continue
+			}
+
+			//counter compute
+			n := tmp.Count + 1
+			tmp.Count = n
+			//max/min compute
+			if fv < tmp.Min {
+				tmp.Min = fv
+			} else if fv > tmp.Max {
+				tmp.Max = fv
+			}
+			//sum compute
+			tmp.Sum += fv
+			//store final data
+			a.cache[name].Data.BaseData.Series[i] = tmp
+		}
+	}
+}
+
+func (m *azureMonitorMetric) findSeries(dv []string) (*azureMonitorSeries, int, bool) {
+	if len(m.Data.BaseData.DimensionNames) != len(dv) {
+		return nil, 0, false
+	}
+	for i := range m.Data.BaseData.Series {
+		if m.Data.BaseData.Series[i].equal(dv) {
+			return m.Data.BaseData.Series[i], i, true
+		}
+	}
+	return nil, 0, false
+}
+
+func newAzureMonitorSeries(dv []string, fv float64) *azureMonitorSeries {
+	return &azureMonitorSeries{
+		DimensionValues: append([]string{}, dv...),
+		Min:             fv,
+		Max:             fv,
+		Sum:             fv,
+		Count:           1,
+	}
+}
+
+func (s *azureMonitorSeries) equal(dv []string) bool {
+	if len(s.DimensionValues) != len(dv) {
+		return false
+	}
+	for i := range dv {
+		if dv[i] != s.DimensionValues[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func convert(in interface{}) (float64, bool) {
+	switch v := in.(type) {
+	case int:
+		return float64(v), true
+	case int8:
+		return float64(v), true
+	case int16:
+		return float64(v), true
+	case int32:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	case uint:
+		return float64(v), true
+	case uint8:
+		return float64(v), true
+	case uint16:
+		return float64(v), true
+	case uint32:
+		return float64(v), true
+	case uint64:
+		return float64(v), true
+	case float32:
+		return float64(v), true
+	case float64:
+		return v, true
+	case string:
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			log.Printf("converted string: %s to %v", v, f)
+			return 0, false
+		}
+		return f, true
+	default:
+		log.Printf("did not convert %T: %s", v, v)
+		return 0, false
+	}
+}
+
+func (a *AzureMonitor) push() {
+	var body []byte
+	for _, metric := range a.cache {
+		jsonBytes, err := json.Marshal(&metric)
+		if err != nil {
+			log.Printf("Error marshalling metrics %s", err)
+			return
+		}
+		body = append(body, jsonBytes...)
+		body = append(body, '\n')
+	}
+
+	log.Printf("Publishing metrics %s", body)
+	_, err := a.postData(&body)
+	if err != nil {
+		log.Printf("Error publishing aggregate metrics %s", err)
+	}
+	return
+}
+
+func (a *AzureMonitor) postData(msg *[]byte) (*http.Request, error) {
+	metricsEndpoint := fmt.Sprintf("https://%s.monitoring.azure.com%s/metrics",
+		a.Region, a.ResourceID)
+
+	req, err := http.NewRequest("POST", metricsEndpoint, bytes.NewBuffer(*msg))
+	if err != nil {
+		log.Printf("Error creating HTTP request")
+		return nil, err
+	}
+
+	req.Header.Set("Authorization", "Bearer "+a.bearerToken)
+	req.Header.Set("Content-Type", "application/x-ndjson")
+
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	client := http.Client{
+		Transport: tr,
+		// TODO - fix this
+		//Timeout: time.Duration(s.HTTPPostTimeout * time.Second),
+		Timeout: time.Duration(10 * time.Second),
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return req, err
+	}
+
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 || resp.StatusCode < 200 {
+		var reply []byte
+		reply, err = ioutil.ReadAll(resp.Body)
+
+		if err != nil {
+			reply = nil
+		}
+		return req, fmt.Errorf("Post Error. HTTP response code:%d message:%s reply:\n%s",
+			resp.StatusCode, resp.Status, reply)
+	}
+	return req, nil
 }
 
 func init() {
